@@ -1,0 +1,33 @@
+# Secrets — never commit
+.env
+.env.*
+
+# Apollo export and any other sensitive CSVs
+apollo_export.csv
+apollo_leads.csv
+*.csv
+
+# Local CSV outputs from the old social scraper
+bidshelf_leads.csv
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+scraper.log
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+
+# Old launcher (replaced by run.sh)
+run_scraper.sh
+
+# Old one-shot scripts (kept locally, not pushed)
+backfill_to_sheet.py
+import_apollo.py
