@@ -39,15 +39,19 @@ from tavily import TavilyClient
 # LOAD .env (simple parser — no external dep needed)
 # ============================================================================
 def _load_env_file() -> None:
-    env_path = Path(__file__).parent / ".env"
-    if not env_path.exists():
-        return
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, val = line.split("=", 1)
-        os.environ.setdefault(key.strip(), val.strip())
+    """Load .env from the same dir as this script, or one level up.
+    Lets us deploy the code in /opt/bidshelf-scraper/app/ while keeping
+    the .env at /opt/bidshelf-scraper/.env (shared with the venv)."""
+    here = Path(__file__).resolve().parent
+    for env_path in (here / ".env", here.parent / ".env"):
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                os.environ.setdefault(key.strip(), val.strip())
+            return
 
 
 _load_env_file()
