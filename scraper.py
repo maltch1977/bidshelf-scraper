@@ -426,6 +426,9 @@ class Consulti:
 
     # Title-priority ranking — lower = higher priority. Used to pick the best
     # contact when Consulti returns multiple matches at a firm.
+    # NOTE: no generic "Vice President" catchall — Consulti's title filter is a
+    # substring match, so "President" inside "Vice President" returns lots of
+    # off-target VPs (Insurance, Risk, HR, Finance). Require a specific keyword.
     TITLE_PRIORITIES = [
         ("preconstruction",      1),
         ("pre-construction",     1),
@@ -440,7 +443,6 @@ class Consulti:
         ("chief executive",      4),
         ("owner",                4),
         ("principal",            4),
-        ("vice president",       5),  # generic VP, last resort
     ]
 
     def __init__(self, key: str):
@@ -451,7 +453,14 @@ class Consulti:
         }
 
     def search_at_firm(self, company_name: str, target_domain: str, size: int = 10) -> list:
-        """Search Consulti for leads at a company, filter to our target domain."""
+        """Search Consulti for leads at a company.
+
+        Returns raw Consulti results. We trust Consulti's `company` substring
+        match to scope results to the right firm — its `company_domain` field
+        often differs from what we scraped off the job posting (e.g., we scrape
+        hittcontracting.com from a LinkedIn job page, Consulti has hitt.com as
+        the canonical work-email domain).
+        """
         body = {
             "company": company_name,
             "titles": self.SEARCH_TITLES,
@@ -468,20 +477,17 @@ class Consulti:
             if r.status_code != 200:
                 print(f"    [Consulti] HTTP {r.status_code}: {r.text[:200]}")
                 return []
-            data = r.json()
-            leads = data.get("leads") or []
-            # Filter to leads whose work-email domain matches our target — guards
-            # against Consulti substring-matching a similarly-named subsidiary.
-            return [
-                lead for lead in leads
-                if normalize_domain(lead.get("company_domain")) == target_domain
-            ]
+            return (r.json().get("leads") or [])
         except Exception as e:
             print(f"    [Consulti] error: {e}")
             return []
 
     @classmethod
     def pick_best(cls, leads: list) -> Optional[dict]:
+        """Return the highest-priority lead, or None if no lead has a
+        proposal-relevant title. Title gate prevents Insurance/Risk/HR VPs from
+        slipping through (Consulti's title filter is substring-style, so
+        searching 'President' returns lots of 'Vice President of <anything>')."""
         if not leads:
             return None
 
@@ -492,7 +498,26 @@ class Consulti:
                     return tier
             return 99
 
-        return sorted(leads, key=score)[0]
+        best = sorted(leads, key=score)[0]
+        if score(best) >= 99:
+            return None  # no proposal-relevant title in the result set
+        return best
+
+    @staticmethod
+    def enriched_domains(contact: dict) -> set:
+        """Extract all possible 'true' domains for a Consulti contact — used
+        for Apollo cross-target checks. Returns a set of normalized domains
+        from both the contact's email and Consulti's company_domain field."""
+        out = set()
+        email = (contact.get("email") or "").strip()
+        if "@" in email:
+            d = normalize_domain(email.rsplit("@", 1)[1])
+            if d:
+                out.add(d)
+        cd = normalize_domain(contact.get("company_domain"))
+        if cd:
+            out.add(cd)
+        return out
 
     def credits_remaining(self) -> Optional[int]:
         try:
@@ -662,6 +687,18 @@ def main() -> None:
             if not best_contact or not best_contact.get("email"):
                 print(f"    [Skip] No Consulti contact for {domain}")
                 sb.record_url(url, qualified=False, rejection_reason=f"no_consulti_contact:{domain}", source_query=query)
+                scraped_urls.add(url)
+                continue
+
+            # Apollo cross-target check using the enriched (true) domains —
+            # catches the case where we scraped a marketing/redirect domain
+            # but the firm's actual work-email domain IS in your Apollo list.
+            cross_domains = Consulti.enriched_domains(best_contact)
+            apollo_hit = cross_domains & apollo_domains
+            if apollo_hit:
+                hit = next(iter(apollo_hit))
+                print(f"    [Skip] Apollo cross-target via enriched domain: {hit}")
+                sb.record_url(url, qualified=False, rejection_reason=f"apollo_cross_target_enriched:{hit}", source_query=query)
                 scraped_urls.add(url)
                 continue
 

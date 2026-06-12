@@ -44,10 +44,18 @@ def main() -> None:
     if credits is not None:
         print(f"Consulti credits remaining: {credits}")
 
-    print("Fetching unenriched scraped_leads rows...")
+    print("Loading Apollo domains for cross-target check...")
+    apollo_domains = sb.get_apollo_domains()
+    print(f"  {len(apollo_domains)} Apollo domains loaded.")
+
+    # Re-process anything that's not currently in 'found' state. That covers
+    # NULL (never tried) plus 'no_match' (failed under a previous, stricter
+    # filter and now deserves another shot).
+    print("Fetching scraped_leads rows that need (re)enrichment...")
     r = requests.get(
         f"{SUPABASE_URL}/rest/v1/leadgen_scraped_leads"
-        "?enrichment_status=is.null&select=*&order=extracted_at.asc",
+        "?or=(enrichment_status.is.null,enrichment_status.eq.no_match)"
+        "&select=*&order=extracted_at.asc",
         headers=sb.headers,
         timeout=30,
     )
@@ -57,6 +65,7 @@ def main() -> None:
 
     found = 0
     no_match = 0
+    apollo_skip = 0
 
     for row in rows:
         company = (row.get("company_name") or "").strip()
@@ -82,6 +91,20 @@ def main() -> None:
             no_match += 1
             continue
 
+        # Apollo cross-target check via enriched domains
+        cross = Consulti.enriched_domains(best) & apollo_domains
+        if cross:
+            hit = next(iter(cross))
+            print(f"    → Apollo cross-target via {hit} — skip")
+            requests.patch(
+                f"{SUPABASE_URL}/rest/v1/leadgen_scraped_leads?id=eq.{row['id']}",
+                headers={**sb.headers, "Prefer": "return=minimal"},
+                json={"enrichment_source": "consulti", "enrichment_status": f"apollo_cross_target:{hit}", "enriched_at": now},
+                timeout=30,
+            )
+            apollo_skip += 1
+            continue
+
         contact_name = (
             f"{(best.get('first_name') or '').strip()} "
             f"{(best.get('last_name') or '').strip()}"
@@ -105,7 +128,7 @@ def main() -> None:
         print(f"    → {contact_name} ({best.get('job_title')}) {best.get('email')}")
         found += 1
 
-    print(f"\nDone. Found contact: {found}  No match: {no_match}")
+    print(f"\nDone. Found contact: {found}  No match: {no_match}  Apollo cross-target skip: {apollo_skip}")
 
 
 if __name__ == "__main__":
