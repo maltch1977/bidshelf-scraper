@@ -22,6 +22,7 @@ Run:
 
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -452,17 +453,80 @@ class Consulti:
             "Content-Type": "application/json",
         }
 
-    def search_at_firm(self, company_name: str, target_domain: str, size: int = 10) -> list:
-        """Search Consulti for leads at a company.
+    # Suffixes stripped when generating shorter search candidates.
+    _SUFFIX_RE = re.compile(
+        r"\s*(?:[,\-—]\s*)?(?:"
+        r"a [A-Za-z]+ Company|a [A-Za-z]+ Corporation"
+        r"|Incorporated|Inc|LLC|L\.L\.C\.?|Ltd|Limited|Corp|Corporation|Company|Co"
+        r"|PLC|GmbH|LP|LLP|PA|PC|PLLC"
+        r"|General Contractors?|Construction Group|Construction Company|Construction Corp"
+        r"|Construction Inc|Construction Co|Construction"
+        r"|Contracting|Contractors?|Builders?|Group"
+        r")\.?\s*$",
+        flags=re.IGNORECASE,
+    )
 
-        Returns raw Consulti results. We trust Consulti's `company` substring
-        match to scope results to the right firm — its `company_domain` field
-        often differs from what we scraped off the job posting (e.g., we scrape
-        hittcontracting.com from a LinkedIn job page, Consulti has hitt.com as
-        the canonical work-email domain).
+    @classmethod
+    def search_candidates(cls, company_name: str, domain: str = "") -> list:
+        """Generate progressively shorter query variants for Consulti's
+        substring company filter.
+
+        Consulti indexes firms under cleaner short names ("HITT Contracting")
+        than what Kimi extracts from job postings ("Hitt Contracting Inc").
+        Long formal names fail substring match. We try the full name, then
+        strip legal/industry suffixes, then fall back to a domain-derived
+        token like 'Mastec' (from mastec.com).
         """
+        name = (company_name or "").strip()
+        out: list = []
+        seen: Set[str] = set()
+
+        def add(s: str):
+            s = s.strip(" ,.-—\t")
+            key = s.lower()
+            if s and key not in seen and len(s) >= 3:
+                seen.add(key)
+                out.append(s)
+
+        if name:
+            add(name)
+            # Apply suffix stripping up to twice (handles "Construction Inc" → "Inc" → done)
+            cleaned = cls._SUFFIX_RE.sub("", name).strip()
+            cleaned2 = cls._SUFFIX_RE.sub("", cleaned).strip()
+            add(cleaned)
+            add(cleaned2)
+
+        # Domain fallback: "willmengconstruction.com" → "willmeng", "mastec.com" → "Mastec".
+        if domain:
+            sld = domain.split(".")[0].lower()
+            for suffix in ("construction", "contracting", "contractors", "builders", "construct", "group", "inc", "corp"):
+                if sld.endswith(suffix) and len(sld) > len(suffix) + 2:
+                    sld = sld[: -len(suffix)]
+                    break
+            if sld and len(sld) >= 4:
+                add(sld.capitalize())
+
+        return out
+
+    def search_at_firm(self, company_name: str, target_domain: str, size: int = 10) -> list:
+        """Search Consulti for leads at a company by trying progressively
+        shorter query variants until one returns results. Returns the first
+        non-empty result set (or [] if no variant matches).
+
+        Consulti's `company_domain` field often differs from what we scraped
+        off the job posting (we get hittcontracting.com from a LinkedIn page,
+        Consulti has hitt.com as the canonical work-email domain). We trust
+        Consulti's company-name substring match to scope results.
+        """
+        for candidate in self.search_candidates(company_name, target_domain):
+            leads = self._search_with_company(candidate, size)
+            if leads:
+                return leads
+        return []
+
+    def _search_with_company(self, company: str, size: int) -> list:
         body = {
-            "company": company_name,
+            "company": company,
             "titles": self.SEARCH_TITLES,
             "countries": ["United States"],
             "size": size,
@@ -475,11 +539,11 @@ class Consulti:
                 timeout=30,
             )
             if r.status_code != 200:
-                print(f"    [Consulti] HTTP {r.status_code}: {r.text[:200]}")
+                print(f"    [Consulti] HTTP {r.status_code} for '{company}': {r.text[:160]}")
                 return []
             return (r.json().get("leads") or [])
         except Exception as e:
-            print(f"    [Consulti] error: {e}")
+            print(f"    [Consulti] error for '{company}': {e}")
             return []
 
     @classmethod
