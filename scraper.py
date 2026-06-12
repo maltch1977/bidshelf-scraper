@@ -546,6 +546,11 @@ class Consulti:
             print(f"    [Consulti] error for '{company}': {e}")
             return []
 
+    # "Vice President of X" should never qualify on the "president" keyword
+    # alone — only on a domain-relevant keyword. Catches "VP, Insurance &
+    # Risk Management" type titles that slipped in via substring match.
+    _VP_PATTERN = re.compile(r"\bvice president\b|\bvp\b\.?", re.IGNORECASE)
+
     @classmethod
     def pick_best(cls, leads: list) -> Optional[dict]:
         """Return the highest-priority lead, or None if no lead has a
@@ -557,8 +562,13 @@ class Consulti:
 
         def score(lead):
             title = (lead.get("job_title") or "").lower()
+            is_vp = bool(cls._VP_PATTERN.search(title))
             for keyword, tier in cls.TITLE_PRIORITIES:
                 if keyword in title:
+                    # 'president' substring-matched inside 'Vice President'
+                    # doesn't count. Keep looking for a real keyword.
+                    if keyword == "president" and is_vp:
+                        continue
                     return tier
             return 99
 
