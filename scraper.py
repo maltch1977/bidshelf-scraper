@@ -67,15 +67,17 @@ KIMI_BASE_URL = os.environ.get("KIMI_BASE_URL", "https://api.moonshot.ai/v1")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "")
+CONSULTI_API_KEY = os.environ.get("CONSULTI_API_KEY", "")
 
 MAX_RESULTS_PER_QUERY = int(os.environ.get("MAX_RESULTS_PER_QUERY", "10"))
 TAVILY_DELAY_S = float(os.environ.get("TAVILY_DELAY_S", "2.0"))
 LLM_DELAY_S = float(os.environ.get("LLM_DELAY_S", "1.0"))
+CONSULTI_DELAY_S = float(os.environ.get("CONSULTI_DELAY_S", "0.5"))
 MAX_CONTENT_LENGTH = int(os.environ.get("MAX_CONTENT_LENGTH", "12000"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "1024"))
 
 # Fail fast on missing secrets
-for name in ("TAVILY_API_KEY", "KIMI_API_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_KEY"):
+for name in ("TAVILY_API_KEY", "KIMI_API_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_KEY", "CONSULTI_API_KEY"):
     if not os.environ.get(name):
         print(f"FATAL: {name} is not set in .env", file=sys.stderr)
         sys.exit(1)
@@ -395,21 +397,135 @@ def normalize_domain(s: Optional[str]) -> Optional[str]:
 
 
 # ============================================================================
+# CONSULTI ENRICHMENT
+# ============================================================================
+class Consulti:
+    """Client for Consulti.ai's B2B lead search.
+
+    Given a firm's name + domain, find a senior, proposal-relevant contact at the
+    firm. Returns None if no usable contact is found — caller MUST silent-skip
+    those firms so half-formed leads never reach the sales-team Sheet.
+    """
+
+    BASE = "https://www.consulti.ai/api/v1"
+
+    # Title keywords we search Consulti for. Broad enough to catch variants
+    # ("Director of Preconstruction", "VP Pre-Construction", etc.) since
+    # Consulti's `titles` filter is substring-style.
+    SEARCH_TITLES = [
+        "Preconstruction",
+        "Pre-Construction",
+        "Business Development",
+        "Proposal",
+        "Estimator",
+        "Estimating",
+        "President",
+        "CEO",
+        "Owner",
+    ]
+
+    # Title-priority ranking — lower = higher priority. Used to pick the best
+    # contact when Consulti returns multiple matches at a firm.
+    TITLE_PRIORITIES = [
+        ("preconstruction",      1),
+        ("pre-construction",     1),
+        ("proposal",             1),
+        ("rfp",                  1),
+        ("business development", 2),
+        ("bd ",                  2),
+        ("estimator",            3),
+        ("estimating",           3),
+        ("president",            4),
+        ("ceo",                  4),
+        ("chief executive",      4),
+        ("owner",                4),
+        ("principal",            4),
+        ("vice president",       5),  # generic VP, last resort
+    ]
+
+    def __init__(self, key: str):
+        self.key = key
+        self.headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        }
+
+    def search_at_firm(self, company_name: str, target_domain: str, size: int = 10) -> list:
+        """Search Consulti for leads at a company, filter to our target domain."""
+        body = {
+            "company": company_name,
+            "titles": self.SEARCH_TITLES,
+            "countries": ["United States"],
+            "size": size,
+        }
+        try:
+            r = requests.post(
+                f"{self.BASE}/leads/search",
+                headers=self.headers,
+                json=body,
+                timeout=30,
+            )
+            if r.status_code != 200:
+                print(f"    [Consulti] HTTP {r.status_code}: {r.text[:200]}")
+                return []
+            data = r.json()
+            leads = data.get("leads") or []
+            # Filter to leads whose work-email domain matches our target — guards
+            # against Consulti substring-matching a similarly-named subsidiary.
+            return [
+                lead for lead in leads
+                if normalize_domain(lead.get("company_domain")) == target_domain
+            ]
+        except Exception as e:
+            print(f"    [Consulti] error: {e}")
+            return []
+
+    @classmethod
+    def pick_best(cls, leads: list) -> Optional[dict]:
+        if not leads:
+            return None
+
+        def score(lead):
+            title = (lead.get("job_title") or "").lower()
+            for keyword, tier in cls.TITLE_PRIORITIES:
+                if keyword in title:
+                    return tier
+            return 99
+
+        return sorted(leads, key=score)[0]
+
+    def credits_remaining(self) -> Optional[int]:
+        try:
+            r = requests.get(f"{self.BASE}/credits", headers=self.headers, timeout=10)
+            if r.status_code != 200:
+                return None
+            return r.json().get("data", {}).get("lead_credits")
+        except Exception:
+            return None
+
+
+# ============================================================================
 # GOOGLE SHEET PUSHER (fire-and-forget; CSV write removed since DB is canonical)
 # ============================================================================
 def post_to_sheet(lead_row: dict) -> None:
+    """Push a fully-enriched lead row to the Google Sheet for the sales team."""
     if not SHEETS_WEBHOOK_URL:
         return
     payload = {
-        "website_or_profile": lead_row.get("website") or lead_row.get("linkedin_url") or "",
-        "project_specs": f"{lead_row.get('job_title', '')} | {lead_row.get('signal_type', '')} | {lead_row.get('signal_heat', '')}",
-        "source_platform": "Job Board",
-        "posted_date": "",
-        "business_context": f"{lead_row.get('company_name', '')} | {lead_row.get('city', '')}, {lead_row.get('state', '')}",
-        "reasoning": lead_row.get("reasoning", ""),
-        "source_url": lead_row.get("job_posting_url", ""),
-        "extracted_at": lead_row.get("extracted_at", ""),
-        "search_query": lead_row.get("source_query", ""),
+        "company_name":         lead_row.get("company_name") or "",
+        "domain":               lead_row.get("domain") or "",
+        "contact_name":         lead_row.get("contact_name") or "",
+        "contact_title":        lead_row.get("contact_title") or "",
+        "contact_email":        lead_row.get("contact_email") or "",
+        "contact_linkedin_url": lead_row.get("contact_linkedin_url") or "",
+        "signal_heat":          lead_row.get("signal_heat") or "",
+        "signal_type":          lead_row.get("signal_type") or "",
+        "job_title":            lead_row.get("job_title") or "",
+        "job_posting_url":      lead_row.get("job_posting_url") or "",
+        "city":                 lead_row.get("city") or "",
+        "state":                lead_row.get("state") or "",
+        "reasoning":            lead_row.get("reasoning") or "",
+        "extracted_at":         lead_row.get("extracted_at") or "",
     }
     try:
         r = requests.post(SHEETS_WEBHOOK_URL, json=payload, timeout=15)
@@ -450,6 +566,11 @@ def main() -> None:
     tavily = TavilyClient(api_key=TAVILY_API_KEY)
     kimi = OpenAI(api_key=KIMI_API_KEY, base_url=KIMI_BASE_URL)
     sb = Supabase(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    consulti = Consulti(CONSULTI_API_KEY)
+
+    credits = consulti.credits_remaining()
+    if credits is not None:
+        print(f"[INIT] Consulti credits remaining: {credits}")
 
     print("[INIT] Loading Apollo domains for dedup...")
     apollo_domains = sb.get_apollo_domains()
@@ -532,6 +653,23 @@ def main() -> None:
                 scraped_urls.add(url)
                 continue
 
+            # ---- CONSULTI ENRICHMENT ----
+            # Without a usable contact, the lead can't be acted on, so we silent-skip.
+            consulti_matches = consulti.search_at_firm(firm.company_name or "", domain)
+            time.sleep(CONSULTI_DELAY_S)
+            best_contact = Consulti.pick_best(consulti_matches)
+
+            if not best_contact or not best_contact.get("email"):
+                print(f"    [Skip] No Consulti contact for {domain}")
+                sb.record_url(url, qualified=False, rejection_reason=f"no_consulti_contact:{domain}", source_query=query)
+                scraped_urls.add(url)
+                continue
+
+            contact_name = (
+                f"{(best_contact.get('first_name') or '').strip()} "
+                f"{(best_contact.get('last_name') or '').strip()}"
+            ).strip() or None
+
             # ---- NEW LEAD ----
             now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             lead_row = {
@@ -548,12 +686,24 @@ def main() -> None:
                 "reasoning": firm.reasoning,
                 "source_query": query,
                 "extracted_at": now,
+                # contact (Consulti)
+                "contact_name":         contact_name,
+                "contact_title":        best_contact.get("job_title"),
+                "contact_email":        best_contact.get("email"),
+                "contact_phone":        None,  # /leads/search doesn't return phone
+                "contact_linkedin_url": best_contact.get("linkedin_url"),
+                "enrichment_source":    "consulti",
+                "enrichment_status":    "found",
+                "enriched_at":          now,
             }
             if sb.insert_lead(lead_row):
                 scraped_domains.add(domain)
                 total_new += 1
                 heat = (firm.signal_heat or "?").upper()
-                print(f"    [LEAD {heat}] {firm.company_name} | {firm.job_title} | {domain}")
+                print(
+                    f"    [LEAD {heat}] {firm.company_name} | {contact_name} ({best_contact.get('job_title')}) | "
+                    f"{best_contact.get('email')}"
+                )
                 post_to_sheet(lead_row)
                 sb.record_url(url, qualified=True, rejection_reason=None, source_query=query)
             else:
