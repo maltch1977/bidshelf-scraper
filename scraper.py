@@ -343,7 +343,21 @@ def _clean_json_response(text: str) -> str:
     return text.strip()
 
 
-def extract_firm(content: str, source_url: str, kimi: OpenAI) -> Optional[FirmExtraction]:
+class TransientExtractionError(Exception):
+    """Raised when Kimi extraction fails for a RETRYABLE reason (rate limit,
+    timeout, 5xx) after exhausting in-call retries. The caller skips the URL
+    WITHOUT caching it, so the next run reprocesses it instead of permanently
+    dropping the lead. Distinct from a None return, which means a PERMANENT
+    failure (off-schema / malformed JSON) that is safe to cache and move past."""
+
+
+# Substrings that mark an exception as transient/retryable rather than a hard
+# failure. Kept loose because the OpenAI SDK surfaces provider errors as opaque
+# strings ("Error code: 429 ...", "Read timed out", "502 Bad Gateway").
+_TRANSIENT_MARKERS = ("rate", "429", "timeout", "timed out", "502", "503", "504", "overloaded", "connection")
+
+
+def extract_firm(content: str, source_url: str, kimi: OpenAI, max_retries: int = 3) -> Optional[FirmExtraction]:
     schema_str = json.dumps(FirmExtraction.model_json_schema(), indent=2)
     user_prompt = (
         f"Source URL: {source_url}\n\n"
@@ -354,34 +368,46 @@ def extract_firm(content: str, source_url: str, kimi: OpenAI) -> Optional[FirmEx
         f"Output ONLY valid JSON. No markdown fences, no preamble, no commentary.\n\n"
         f"{schema_str}"
     )
-    try:
-        completion = kimi.chat.completions.create(
-            model=KIMI_MODEL,
-            max_tokens=MAX_TOKENS,
-            temperature=0.0,
-            messages=[
-                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        raw = completion.choices[0].message.content or ""
-        cleaned = _clean_json_response(raw)
-        parsed = json.loads(cleaned)
-        return FirmExtraction.model_validate(parsed)
-    except ValidationError as e:
-        print(f"    [LLM] Validation error: {e}")
-        return None
-    except json.JSONDecodeError as e:
-        print(f"    [LLM] JSON decode error: {e}")
-        return None
-    except Exception as e:
-        err = str(e).lower()
-        if "rate" in err or "429" in err:
-            print("    [LLM] Rate limited; sleeping 60s...")
-            time.sleep(60)
-            return extract_firm(content, source_url, kimi)
-        print(f"    [LLM] Error: {e}")
-        return None
+    last_err: Optional[Exception] = None
+    # Bounded retry loop (replaces the old unbounded recursion, which could
+    # recurse indefinitely / blow the stack under a sustained rate limit).
+    for attempt in range(max_retries + 1):
+        try:
+            completion = kimi.chat.completions.create(
+                model=KIMI_MODEL,
+                max_tokens=MAX_TOKENS,
+                temperature=0.0,
+                messages=[
+                    {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            raw = completion.choices[0].message.content or ""
+            cleaned = _clean_json_response(raw)
+            parsed = json.loads(cleaned)
+            return FirmExtraction.model_validate(parsed)
+        except ValidationError as e:
+            print(f"    [LLM] Validation error (permanent): {e}")
+            return None  # model produced off-schema output — caching is correct
+        except json.JSONDecodeError as e:
+            print(f"    [LLM] JSON decode error (permanent): {e}")
+            return None  # malformed JSON for this content — caching is correct
+        except Exception as e:
+            last_err = e
+            transient = any(m in str(e).lower() for m in _TRANSIENT_MARKERS)
+            if transient and attempt < max_retries:
+                backoff = min(120, 30 * (2 ** attempt))  # 30s, 60s, 120s
+                print(f"    [LLM] Transient error (attempt {attempt + 1}/{max_retries}); sleeping {backoff}s: {e}")
+                time.sleep(backoff)
+                continue
+            if transient:
+                # Exhausted retries on a retryable error — signal the caller to
+                # leave the URL uncached so it gets another shot next run.
+                raise TransientExtractionError(str(e))
+            print(f"    [LLM] Error (permanent): {e}")
+            return None
+    # Loop fell through on transient exhaustion.
+    raise TransientExtractionError(str(last_err) if last_err else "unknown transient error")
 
 
 def normalize_domain(s: Optional[str]) -> Optional[str]:
@@ -531,20 +557,32 @@ class Consulti:
             "countries": ["United States"],
             "size": size,
         }
-        try:
-            r = requests.post(
-                f"{self.BASE}/leads/search",
-                headers=self.headers,
-                json=body,
-                timeout=30,
-            )
-            if r.status_code != 200:
-                print(f"    [Consulti] HTTP {r.status_code} for '{company}': {r.text[:160]}")
+        # One retry on a rate-limit / transient failure: otherwise a 429 returns []
+        # which the caller can't tell apart from a genuine "no contact" and caches
+        # the URL forever — silently dropping an enrichable lead.
+        for attempt in range(2):
+            try:
+                r = requests.post(
+                    f"{self.BASE}/leads/search",
+                    headers=self.headers,
+                    json=body,
+                    timeout=30,
+                )
+                if r.status_code == 429 and attempt == 0:
+                    print(f"    [Consulti] 429 for '{company}'; backing off 5s and retrying")
+                    time.sleep(5)
+                    continue
+                if r.status_code != 200:
+                    print(f"    [Consulti] HTTP {r.status_code} for '{company}': {r.text[:160]}")
+                    return []
+                return (r.json().get("leads") or [])
+            except Exception as e:
+                print(f"    [Consulti] error for '{company}' (attempt {attempt + 1}/2): {e}")
+                if attempt == 0:
+                    time.sleep(2)
+                    continue
                 return []
-            return (r.json().get("leads") or [])
-        except Exception as e:
-            print(f"    [Consulti] error for '{company}': {e}")
-            return []
+        return []
 
     # "Vice President of X" should never qualify on the "president" keyword
     # alone — only on a domain-relevant keyword. Catches "VP, Insurance &
@@ -691,16 +729,24 @@ def main() -> None:
         if _shutdown:
             break
         print(f"\n[{q_idx}/{len(JOB_BOARD_QUERIES)}] {query[:80]}")
-        try:
-            resp = tavily.search(query=query, max_results=MAX_RESULTS_PER_QUERY, search_depth="advanced")
-            results = [
-                {"url": str(r.get("url") or "").strip(), "content": str(r.get("content") or "").strip()}
-                for r in resp.get("results", [])
-                if r.get("url") and r.get("content")
-            ]
-        except Exception as e:
-            print(f"  [Tavily] error: {e}")
-            time.sleep(TAVILY_DELAY_S)
+        # Bounded retry: one transient Tavily failure (429 / timeout / 5xx) no
+        # longer silently drops the entire query's results — we back off and retry
+        # once before giving up on this query.
+        results: Optional[list] = None
+        for attempt in range(2):
+            try:
+                resp = tavily.search(query=query, max_results=MAX_RESULTS_PER_QUERY, search_depth="advanced")
+                results = [
+                    {"url": str(r.get("url") or "").strip(), "content": str(r.get("content") or "").strip()}
+                    for r in resp.get("results", [])
+                    if r.get("url") and r.get("content")
+                ]
+                break
+            except Exception as e:
+                print(f"  [Tavily] error (attempt {attempt + 1}/2): {e}")
+                time.sleep(TAVILY_DELAY_S * (attempt + 1))
+        if results is None:
+            print("  [Tavily] giving up on this query after 2 attempts.")
             continue
 
         print(f"  [Tavily] {len(results)} results.")
@@ -718,10 +764,19 @@ def main() -> None:
                 continue
 
             print(f"    [{r_idx}] Analyzing: {url[:80]}")
-            firm = extract_firm(content, url, kimi)
+            try:
+                firm = extract_firm(content, url, kimi)
+            except TransientExtractionError as e:
+                # Retryable LLM failure — DON'T cache the URL; next run retries it
+                # so a rate-limit window doesn't permanently drop the lead.
+                print(f"    [Retry-next-run] LLM transient, leaving URL uncached: {str(e)[:120]}")
+                time.sleep(LLM_DELAY_S)
+                continue
             time.sleep(LLM_DELAY_S)
 
             if firm is None:
+                # Permanent extraction failure (off-schema / malformed) — safe to
+                # cache so we don't burn the LLM on it again.
                 sb.record_url(url, qualified=False, rejection_reason="extraction_error", source_query=query)
                 scraped_urls.add(url)
                 continue
@@ -817,9 +872,11 @@ def main() -> None:
                 )
                 post_to_sheet(lead_row)
                 sb.record_url(url, qualified=True, rejection_reason=None, source_query=query)
+                scraped_urls.add(url)
             else:
-                sb.record_url(url, qualified=False, rejection_reason="insert_failed", source_query=query)
-            scraped_urls.add(url)
+                # Transient DB failure (hiccup / race) — DON'T cache the URL so the
+                # next run retries this fully-enriched lead instead of losing it.
+                print(f"    [Retry-next-run] insert failed for {domain}; leaving URL uncached")
 
         elapsed = time.time() - start
         rate = total_processed / elapsed if elapsed > 0 else 0
